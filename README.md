@@ -1,3 +1,4 @@
+<img width="1751" height="689" alt="live exporter github" src="https://github.com/user-attachments/assets/4e135e64-c29f-494b-9e4d-554abe8cab56" />
 ## Windows Live Mail → Outlook PST Exporter
 
 This is a small Windows-only GUI tool that takes a Windows Live Mail message store (folders full of `.eml` files) and imports everything into an Outlook PST file using Outlook's COM automation.
