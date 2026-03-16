@@ -1,15 +1,6 @@
 # Rust
 wlm_exporter_rust/target/
 **/*.rs.bk
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-.venv/
-venv/
-env/
 
 # App artifacts (generated at runtime)
 export_log.txt
