@@ -3,6 +3,12 @@ import sys
 import traceback
 import threading
 import logging
+import shutil
+import tempfile
+import csv
+import ctypes
+from email import policy
+from email.parser import BytesParser
 from pathlib import Path
 from tkinter import Tk, Label, Button, Entry, StringVar, filedialog, messagebox
 from tkinter import ttk
@@ -73,6 +79,21 @@ def ensure_pst_folder_for_eml(import_root, root: Path, eml_path: Path, folder_ca
         current_folder = next_folder
 
     return current_folder
+
+
+def get_short_path(path: Path) -> str:
+    """
+    Return the Windows 8.3 short path, if available, otherwise the original path.
+    This helps work around Outlook 'Invalid path or URL' errors on some systems.
+    """
+    try:
+        buf = ctypes.create_unicode_buffer(4096)
+        ret = ctypes.windll.kernel32.GetShortPathNameW(str(path), buf, len(buf))
+        if ret > 0 and ret < len(buf):
+            return buf.value
+    except Exception:
+        logging.warning("GetShortPathNameW failed for %s", path, exc_info=True)
+    return str(path)
 
 
 def run_export_async(
@@ -165,6 +186,17 @@ def run_export(
         errors = 0
         folder_cache = {}
 
+        # Temporary directory for Outlook-friendly .eml copies
+        temp_dir = Path(tempfile.mkdtemp(prefix="wlm_export_"))
+
+        # CSV results log (one line per message)
+        results_csv_path = Path.cwd() / "export_results.csv"
+        results_file = open(results_csv_path, mode="w", newline="", encoding="utf-8")
+        results_writer = csv.writer(results_file)
+        results_writer.writerow(
+            ["index", "total", "eml_path", "relative_path", "status", "error"]
+        )
+
         # Configure progress bar on UI thread
         def init_progress():
             progress_bar["maximum"] = total
@@ -178,6 +210,7 @@ def run_export(
                 logging.info("Stop requested by user at item %d/%d", idx, total)
                 break
 
+            # Determine relative path once per item (used in status and logging)
             try:
                 rel = eml_path.relative_to(root)
             except ValueError:
@@ -193,19 +226,124 @@ def run_export(
             root_window.after(0, status_var.set, status_text)
 
             try:
-                # Open the .eml as an Outlook item, then move/copy into our PST folder.
-                mail_item = session.OpenSharedItem(str(eml_path))
                 # Find / create the matching PST folder structure for this item
-                target_folder = ensure_pst_folder_for_eml(import_root, root, eml_path, folder_cache)
+                target_folder = ensure_pst_folder_for_eml(
+                    import_root, root, eml_path, folder_cache
+                )
 
-                # Copy to avoid modifying the original item if Outlook links it somewhere else
-                copied = mail_item.Copy()
-                copied.Move(target_folder)
-                imported += 1
-            except Exception:
+                # Work around Outlook path/encoding quirks by copying the .eml
+                # to a short, ASCII-only temp path before opening.
+                temp_name = f"msg_{idx}.eml"
+                temp_path = temp_dir / temp_name
+                shutil.copy2(str(eml_path), str(temp_path))
+
+                # Try up to 3 times to import using Outlook's native .eml support:
+                # 1) temp path, 2) 8.3 short path (if available), 3) temp path again.
+                last_err = ""
+                imported_ok = False
+                candidate_paths = [str(temp_path), get_short_path(temp_path), str(temp_path)]
+                for attempt, candidate in enumerate(candidate_paths, start=1):
+                    try:
+                        mail_item = session.OpenSharedItem(candidate)
+                        copied = mail_item.Copy()
+                        copied.Move(target_folder)
+                        imported += 1
+                        imported_ok = True
+                        results_writer.writerow(
+                            [
+                                idx,
+                                total,
+                                str(eml_path),
+                                str(rel),
+                                "imported_via_openshareditem",
+                                "",
+                            ]
+                        )
+                        break
+                    except Exception as e:
+                        last_err = repr(e)
+                        logging.exception(
+                            "Attempt %d failed to import %s via %s",
+                            attempt,
+                            eml_path,
+                            candidate,
+                        )
+
+                if not imported_ok:
+                    # Fallback: parse .eml ourselves and create a new MailItem
+                    try:
+                        with open(temp_path, "rb") as f:
+                            msg = BytesParser(policy=policy.default).parse(f)
+
+                        new_item = outlook.CreateItem(0)  # olMailItem
+                        # Basic headers
+                        subject = msg.get("subject", "")
+                        if subject:
+                            new_item.Subject = subject
+
+                        to_addr = msg.get("to", "")
+                        if to_addr:
+                            new_item.To = to_addr
+
+                        cc_addr = msg.get("cc", "")
+                        if cc_addr:
+                            new_item.CC = cc_addr
+
+                        bcc_addr = msg.get("bcc", "")
+                        if bcc_addr:
+                            new_item.BCC = bcc_addr
+
+                        # Body (prefer plain, else HTML, else raw)
+                        body_text = ""
+                        try:
+                            if msg.is_multipart():
+                                # Prefer text/plain part
+                                for part in msg.walk():
+                                    ctype = part.get_content_type()
+                                    if ctype == "text/plain":
+                                        body_text = part.get_content()
+                                        break
+                                if not body_text:
+                                    # fallback to any text/*
+                                    for part in msg.walk():
+                                        if part.get_content_maintype() == "text":
+                                            body_text = part.get_content()
+                                            break
+                            else:
+                                body_text = msg.get_content()
+                        except Exception:
+                            body_text = ""
+
+                        if body_text:
+                            new_item.Body = body_text
+
+                        # Attach original .eml so nothing is lost
+                        try:
+                            new_item.Attachments.Add(str(temp_path))
+                        except Exception:
+                            logging.warning(
+                                "Failed to attach original EML for %s", eml_path, exc_info=True
+                            )
+
+                        new_item.Move(target_folder)
+                        imported += 1
+                        imported_ok = True
+                        results_writer.writerow(
+                            [idx, total, str(eml_path), str(rel), "imported_via_fallback", last_err]
+                        )
+                    except Exception as e:
+                        errors += 1
+                        logging.exception("Fallback import failed for %s", eml_path)
+                        results_writer.writerow(
+                            [idx, total, str(eml_path), str(rel), "failed", repr(e)]
+                        )
+            except Exception as e:
                 # If Outlook cannot open a given file, skip it
                 logging.exception("Failed to import %s", eml_path)
                 errors += 1
+                results_writer.writerow(
+                    [idx, total, str(eml_path), str(rel), "failed", repr(e)]
+                )
                 continue
 
             # Update progress bar on UI thread
@@ -244,7 +382,19 @@ def run_export(
         try:
             pythoncom.CoUninitialize()
         except Exception:
-            logging.warning("CoUninitialize failed", exc_info=True)
+            pass
+        # Close CSV log
+        try:
+            if "results_file" in locals() and not results_file.closed:
+                results_file.close()
+        except Exception:
+            logging.warning("Failed to close results CSV", exc_info=True)
+        # Best-effort cleanup of temp directory
+        try:
+            if "temp_dir" in locals() and temp_dir.exists():
+                shutil.rmtree(temp_dir, ignore_errors=True)
+        except Exception:
+            logging.warning("Failed to clean up temp dir %s", temp_dir, exc_info=True)
 
 
 def main():
