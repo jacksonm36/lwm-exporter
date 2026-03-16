@@ -1,0 +1,28 @@
+[package]
+name = "wlm_exporter_rust"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+walkdir = "2"
+tempfile = "3"
+csv = "1"
+mailparse = "0.13"
+anyhow = "1"
+thiserror = "1"
+encoding_rs = "0.8"
+chrono = "0.4"
+log = "0.4"
+simplelog = "0.12"
+
+# For Windows FFI and COM interop; COM wiring is left as stubs for now.
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+    "Win32_Storage_FileSystem",
+] }
+iced = { version = "0.12.1", features = ["wgpu", "tokio"] }
+rfd = "0.15"
+
