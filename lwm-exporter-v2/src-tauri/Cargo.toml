@@ -1,0 +1,22 @@
+[package]
+name = "lwm-exporter-v2"
+version = "2.0.0"
+edition = "2021"
+description = "Windows Live Mail → Outlook PST Exporter (Tauri v2 GUI)"
+
+[lib]
+name = "lwm_exporter_v2_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+wlm_exporter_lib = { path = "../../wlm_exporter_rust" }
+log = "0.4"
+simplelog = "0.12"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }

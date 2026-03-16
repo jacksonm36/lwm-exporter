@@ -1,6 +1,10 @@
 # Rust
 wlm_exporter_rust/target/
+lwm-exporter-v2/src-tauri/target/
 **/*.rs.bk
+
+# Tauri v2 / Node
+lwm-exporter-v2/node_modules/
 
 # App artifacts (generated at runtime)
 export_log.txt

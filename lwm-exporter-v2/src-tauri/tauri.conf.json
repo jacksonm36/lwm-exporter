@@ -1,0 +1,47 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "WLM PST Exporter v2",
+  "version": "2.0.0",
+  "identifier": "com.lwmexporter.v2",
+  "build": {
+    "beforeDevCommand": "",
+    "devUrl": "../index.html",
+    "beforeBuildCommand": "",
+    "frontendDist": ".."
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Windows Live Mail → Outlook PST Exporter (v2)",
+        "width": 640,
+        "height": 420,
+        "resizable": true,
+        "fullscreen": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [],
+    "windows": {
+      "certificateThumbprint": null,
+      "digestAlgorithm": "sha256",
+      "timestampUrl": ""
+    },
+    "longDescription": "Import Windows Live Mail .eml folders into an Outlook PST file.",
+    "shortDescription": "WLM to PST Exporter",
+    "category": "Utility",
+    "copyright": "",
+    "kind": "Gui"
+  },
+  "plugins": {
+    "dialog": {
+      "all": true
+    }
+  }
+}

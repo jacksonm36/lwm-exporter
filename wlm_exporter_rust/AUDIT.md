@@ -41,6 +41,17 @@ Audit date: 2025. Summary of findings and fixes applied.
 
 ---
 
+## Tauri v2 frontend (lwm-exporter-v2)
+
+| Finding | Fix |
+|--------|-----|
+| **Error display** | Frontend `catch (e)` used `'Error: ' + e`; when Tauri returns an error object this shows `[object Object]`. | Added `errStr(e)` helper: prefer `e.message`, then `e.toString()`, else `String(e)`. |
+| **Dialog return value** | `open()`/`save()` may return string, `{ path }`, or array depending on Tauri/dialog version. | Added `pathFromSelected(selected)` to normalize to a single path string (handles string, array[0], or `.path`). |
+| **Input validation** | Empty trimmed paths could be passed to Rust. | In `run_export_command`, trim paths and return a clear error if either is empty. |
+| **XSS** | User/error content shown in UI. | All dynamic content is set via `textContent` (no `innerHTML`), so no HTML/script injection. |
+
+---
+
 ## Recommendations
 
 1. When implementing real Outlook COM: validate and sanitize any strings passed to Outlook (e.g. folder names) to avoid injection or invalid names.
