@@ -178,16 +178,16 @@ def run_export(
                 logging.info("Stop requested by user at item %d/%d", idx, total)
                 break
 
+            try:
+                rel = eml_path.relative_to(root)
+            except ValueError:
+                rel = eml_path.name
+
             # Handle pause request
             while control_flags.get("pause") and not control_flags.get("stop"):
                 root_window.after(0, status_var.set, f"Paused at {idx}/{total}: {rel}")
                 pythoncom.PumpWaitingMessages()
                 threading.Event().wait(0.2)
-
-            try:
-                rel = eml_path.relative_to(root)
-            except ValueError:
-                rel = eml_path.name
 
             status_text = f"Importing {idx}/{total}: {rel}"
             root_window.after(0, status_var.set, status_text)
@@ -238,17 +238,17 @@ def run_export(
         logging.error("Unexpected error during export: %s\n%s", e, tb)
         messagebox.showerror(
             APP_TITLE,
-            f"An unexpected error occurred:\n\n{e}\n\nTraceback:\n{tb}",
+            f"An unexpected error occurred:\n\n{e}\n\nDetails have been written to the log file.",
         )
     finally:
         try:
             pythoncom.CoUninitialize()
         except Exception:
-            pass
+            logging.warning("CoUninitialize failed", exc_info=True)
 
 
 def main():
-    log_path = Path.cwd() / "export_log.txt"
+    log_path = Path.home() / "export_log.txt"
     logging.basicConfig(
         filename=log_path,
         filemode="a",
