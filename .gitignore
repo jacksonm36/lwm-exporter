@@ -7,9 +7,11 @@ emls/
 
 # Build artifacts
 build/
-dist/
 *.spec
-*.exe
+
+# Allow dist/ folder with built executables
+!dist/
+!dist/*.exe
 
 # Python
 __pycache__/

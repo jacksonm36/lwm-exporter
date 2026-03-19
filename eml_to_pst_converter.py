@@ -19,6 +19,7 @@ import re
 import logging
 import tempfile
 import uuid
+import atexit
 
 # Configure logging
 logging.basicConfig(
@@ -38,9 +39,12 @@ INBOX_FOLDER_NAME = "Inbox"
 # Check for pywin32
 OUTLOOK_AVAILABLE = False
 WIN32COM = None
+PYTHONCOM = None
 try:
     import win32com.client
+    import pythoncom
     WIN32COM = win32com.client
+    PYTHONCOM = pythoncom
     OUTLOOK_AVAILABLE = True
 except ImportError:
     logger.warning("pywin32 not available - PST conversion will require installation")
@@ -69,6 +73,10 @@ class EmlToPstConverter:
         # Thread safety
         self._lock = threading.Lock()
         self._is_converting = False
+        self._temp_files = []
+        
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        atexit.register(self._cleanup_temp_files)
         
         self.create_widgets()
         
@@ -188,7 +196,7 @@ class EmlToPstConverter:
         self.status_label.pack(side=tk.LEFT, padx=(0, 20))
         
         # Convert and Exit buttons
-        exit_btn = ttk.Button(button_frame, text="Exit", command=self.root.quit, width=10)
+        exit_btn = ttk.Button(button_frame, text="Exit", command=self._on_close, width=10)
         exit_btn.pack(side=tk.RIGHT, padx=(5, 0))
         
         self.convert_btn = ttk.Button(button_frame, text="Convert", command=self.start_conversion, width=10)
@@ -438,42 +446,69 @@ class EmlToPstConverter:
             filename = name[:200-len(ext)] + ext
         return filename
         
+    def _on_close(self):
+        """Handle window close with proper cleanup"""
+        with self._lock:
+            if self._is_converting:
+                if not messagebox.askyesno("Confirm", "Conversion in progress. Exit anyway?"):
+                    return
+        self._cleanup_temp_files()
+        self.root.destroy()
+    
+    def _cleanup_temp_files(self):
+        """Remove any leftover temp files created during attachment handling"""
+        for path in self._temp_files:
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except OSError:
+                pass
+        self._temp_files.clear()
+    
     def start_conversion(self):
         """Start the conversion process in a separate thread"""
-        if self._is_converting:
-            messagebox.showwarning("Warning", "Conversion already in progress!")
-            return
-            
         with self._lock:
+            if self._is_converting:
+                messagebox.showwarning("Warning", "Conversion already in progress!")
+                return
             if not self.eml_files:
                 messagebox.showwarning("Warning", "No EML/EMLX files to convert!")
                 return
+            self._is_converting = True
             
         if not self.destination_path.get():
+            with self._lock:
+                self._is_converting = False
             messagebox.showwarning("Warning", "Please select a destination path!")
             return
         
-        # Validate destination path
         dest_path = self.destination_path.get()
         dest_dir = os.path.dirname(os.path.abspath(dest_path))
         if not os.path.isdir(dest_dir):
+            with self._lock:
+                self._is_converting = False
             messagebox.showerror("Error", f"Destination directory does not exist: {dest_dir}")
             return
             
-        self._is_converting = True
         self.convert_btn.config(state='disabled')
         
-        # Run conversion in a separate thread
         thread = threading.Thread(target=self._convert_files_thread)
         thread.daemon = True
         thread.start()
     
     def _convert_files_thread(self):
-        """Thread wrapper for conversion"""
+        """Thread wrapper for conversion with COM initialization"""
+        com_initialized = False
         try:
+            if PYTHONCOM:
+                PYTHONCOM.CoInitialize()
+                com_initialized = True
             self.convert_files()
         finally:
-            self._is_converting = False
+            if com_initialized:
+                PYTHONCOM.CoUninitialize()
+            with self._lock:
+                self._is_converting = False
             self.root.after(0, lambda: self.convert_btn.config(state='normal'))
         
     def convert_files(self):
@@ -483,7 +518,8 @@ class EmlToPstConverter:
             files_to_process = self.eml_files.copy()
             
         self.root.after(0, lambda: self.progress.config(maximum=total, value=0))
-        self.processed_hashes.clear()
+        with self._lock:
+            self.processed_hashes.clear()
         
         # Check if pywin32 is available
         if not OUTLOOK_AVAILABLE:
@@ -539,50 +575,53 @@ class EmlToPstConverter:
         """Convert using Outlook COM interface (requires Microsoft Outlook)"""
         self._update_status("Connecting to Outlook...")
         
+        outlook = None
+        namespace = None
         try:
-            outlook = WIN32COM.Dispatch("Outlook.Application")
-        except Exception as e:
-            raise Exception(f"Could not connect to Outlook: {e}")
-        
-        try:
-            namespace = outlook.GetNamespace("MAPI")
-        except Exception as e:
-            raise Exception(f"Could not access MAPI namespace: {e}")
-        
-        # Clean up stale store references first
-        self._cleanup_stale_stores(namespace)
-        
-        pst_path = os.path.abspath(self.destination_path.get())
-        
-        # Create or open PST
-        self._update_status("Creating PST file...")
-        self._setup_pst_store(outlook, namespace, pst_path)
-        
-        # Give Outlook a moment to register the new store
-        time.sleep(1)
+            try:
+                outlook = WIN32COM.Dispatch("Outlook.Application")
+            except Exception as e:
+                raise Exception(f"Could not connect to Outlook: {e}")
             
-        # Find the PST store
-        pst_store = self._find_pst_store(namespace, pst_path)
-        if not pst_store:
-            raise Exception(f"Could not access PST file after creation. Path: {pst_path}")
+            try:
+                namespace = outlook.GetNamespace("MAPI")
+            except Exception as e:
+                raise Exception(f"Could not access MAPI namespace: {e}")
             
-        root_folder = pst_store.GetRootFolder()
-        target_folder = self._get_or_create_inbox(root_folder)
+            self._cleanup_stale_stores(namespace)
             
-        # Process files
-        total = len(files_to_process)
-        converted, skipped, errors, error_messages = self._process_email_files(
-            outlook, namespace, target_folder, files_to_process, total
-        )
-        
-        # Build completion note
-        note = f"\n\nPST saved to: {pst_path}"
-        if error_messages:
-            note += "\n\nErrors:\n" + "\n".join(error_messages[:5])
-            if len(error_messages) > 5:
-                note += f"\n... and {len(error_messages) - 5} more errors"
+            pst_path = os.path.abspath(self.destination_path.get())
             
-        self.root.after(0, lambda: self.show_completion(converted, skipped, errors, note))
+            self._update_status("Creating PST file...")
+            self._setup_pst_store(outlook, namespace, pst_path)
+            
+            time.sleep(1)
+                
+            pst_store = self._find_pst_store(namespace, pst_path)
+            if not pst_store:
+                raise Exception(f"Could not access PST file after creation. Path: {pst_path}")
+                
+            root_folder = pst_store.GetRootFolder()
+            target_folder = self._get_or_create_inbox(root_folder)
+                
+            total = len(files_to_process)
+            converted, skipped, errors, error_messages = self._process_email_files(
+                outlook, namespace, target_folder, files_to_process, total
+            )
+            
+            note = f"\n\nPST saved to: {pst_path}"
+            if error_messages:
+                note += "\n\nErrors:\n" + "\n".join(error_messages[:5])
+                if len(error_messages) > 5:
+                    note += f"\n... and {len(error_messages) - 5} more errors"
+                
+            self.root.after(0, lambda: self.show_completion(converted, skipped, errors, note))
+        finally:
+            # Release COM objects to prevent Outlook from hanging
+            del namespace
+            del outlook
+            import gc
+            gc.collect()
     
     def _update_status(self, text):
         """Thread-safe status update"""
@@ -685,13 +724,21 @@ class EmlToPstConverter:
         
         # Method 3: Initialize Outlook with a temp item, then try AddStore
         try:
-            # Create a temporary mail item to ensure Outlook is fully initialized
             temp_mail = outlook.CreateItem(OL_MAIL_ITEM)
             temp_mail.Subject = "Temp"
             temp_mail.Save()
+            entry_id = temp_mail.EntryID
             temp_mail.Delete()
+            # Permanently remove from Deleted Items
+            try:
+                deleted = namespace.GetDefaultFolder(3)  # olFolderDeletedItems
+                for item in deleted.Items:
+                    if item.EntryID == entry_id:
+                        item.Delete()
+                        break
+            except Exception:
+                pass
             
-            # Try AddStore again after initialization
             namespace.AddStore(pst_path)
             logger.info(f"Created PST using AddStore after init: {pst_path}")
             return
@@ -839,14 +886,12 @@ class EmlToPstConverter:
             
             temp_path = None
             try:
-                # Use secure temp file with unique name to prevent race conditions
                 filename = att.get('filename', 'attachment')
-                # Sanitize filename again for safety
                 safe_filename = self._sanitize_filename(filename)
                 _, ext = os.path.splitext(safe_filename)
                 
-                # Create temp file with unique prefix
                 fd, temp_path = tempfile.mkstemp(suffix=ext, prefix=f"eml_att_{uuid.uuid4().hex[:8]}_")
+                self._temp_files.append(temp_path)
                 try:
                     os.write(fd, att['data'])
                 finally:
@@ -856,10 +901,11 @@ class EmlToPstConverter:
             except (OSError, IOError) as e:
                 logger.warning(f"Could not add attachment {att.get('filename')}: {e}")
             finally:
-                # Clean up temp file
                 if temp_path and os.path.exists(temp_path):
                     try:
                         os.remove(temp_path)
+                        if temp_path in self._temp_files:
+                            self._temp_files.remove(temp_path)
                     except OSError:
                         pass
         
