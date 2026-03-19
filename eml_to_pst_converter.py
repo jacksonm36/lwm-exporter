@@ -220,7 +220,7 @@ class EmlToPstConverter:
             files = self._scan_folder_impl(folder)
             self.root.after(0, lambda: self._add_files_to_list(files))
         except Exception as e:
-            logger.error(f"Error scanning folder: {e}")
+            logger.error("Error scanning folder: %s", e)
             self.root.after(0, lambda: messagebox.showerror("Error", f"Error scanning folder: {e}"))
             
     def _scan_folder_impl(self, folder):
@@ -245,7 +245,7 @@ class EmlToPstConverter:
             
             # Safety limit
             if len(found_files) > MAX_FILES:
-                logger.warning(f"File limit reached ({MAX_FILES})")
+                logger.warning("File limit reached (%d)", MAX_FILES)
                 break
         
         # Remove duplicates while preserving order
@@ -297,7 +297,7 @@ class EmlToPstConverter:
             mod_time = datetime.fromtimestamp(os.path.getmtime(file_path))
             date_str = mod_time.strftime("%Y-%m-%d %H:%M")
         except OSError as e:
-            logger.warning(f"Could not get file info for {file_path}: {e}")
+            logger.warning("Could not get file info for %s: %s", file_path, e)
             size_str = "N/A"
             date_str = "N/A"
             
@@ -366,7 +366,7 @@ class EmlToPstConverter:
                     sha256.update(chunk)
             return sha256.hexdigest()
         except OSError as e:
-            logger.warning(f"Could not hash file {file_path}: {e}")
+            logger.warning("Could not hash file %s: %s", file_path, e)
             return None
             
     def parse_eml(self, file_path):
@@ -386,7 +386,7 @@ class EmlToPstConverter:
                 'message': msg
             }
         except Exception as e:
-            logger.error(f"Error parsing EML file {file_path}: {e}")
+            logger.error("Error parsing EML file %s: %s", file_path, e)
             return None
             
     def get_email_body(self, msg):
@@ -399,17 +399,17 @@ class EmlToPstConverter:
                     try:
                         body = part.get_content()
                         break
-                    except (KeyError, LookupError) as e:
-                        logger.debug(f"Could not decode text/plain part: {e}")
+                    except (KeyError, LookupError, UnicodeDecodeError) as e:
+                        logger.debug("Could not decode text/plain part: %s", e)
                 elif content_type == "text/html" and not body:
                     try:
                         body = part.get_content()
-                    except (KeyError, LookupError) as e:
-                        logger.debug(f"Could not decode text/html part: {e}")
+                    except (KeyError, LookupError, UnicodeDecodeError) as e:
+                        logger.debug("Could not decode text/html part: %s", e)
         else:
             try:
                 body = msg.get_content()
-            except (KeyError, LookupError):
+            except (KeyError, LookupError, UnicodeDecodeError):
                 payload = msg.get_payload(decode=True)
                 body = payload.decode('utf-8', errors='replace') if payload else ""
         return body
@@ -457,13 +457,15 @@ class EmlToPstConverter:
     
     def _cleanup_temp_files(self):
         """Remove any leftover temp files created during attachment handling"""
-        for path in self._temp_files:
+        with self._lock:
+            paths = list(self._temp_files)
+            self._temp_files.clear()
+        for path in paths:
             try:
                 if os.path.exists(path):
                     os.remove(path)
-            except OSError:
-                pass
-        self._temp_files.clear()
+            except OSError as e:
+                logger.debug("Could not remove temp file %s: %s", path, e)
     
     def start_conversion(self):
         """Start the conversion process in a separate thread"""
@@ -531,7 +533,7 @@ class EmlToPstConverter:
             self.convert_with_outlook(files_to_process)
         except Exception as e:
             error_msg = str(e)
-            logger.error(f"Conversion error: {error_msg}")
+            logger.error("Conversion error: %s", error_msg)
             self.root.after(0, lambda: messagebox.showerror(
                 "Conversion Error",
                 f"Error during conversion:\n{error_msg}\n\n"
@@ -562,10 +564,10 @@ class EmlToPstConverter:
                     "Please restart the application to use PST conversion."
                 )
             except subprocess.CalledProcessError as e:
-                logger.error(f"Failed to install pywin32: {e}")
+                logger.error("Failed to install pywin32: %s", e)
                 messagebox.showerror(
                     "Installation Failed",
-                    f"Failed to install pywin32.\n\n"
+                    "Failed to install pywin32.\n\n"
                     "Please run manually in command prompt:\npip install pywin32"
                 )
             
@@ -581,12 +583,12 @@ class EmlToPstConverter:
             try:
                 outlook = WIN32COM.Dispatch("Outlook.Application")
             except Exception as e:
-                raise Exception(f"Could not connect to Outlook: {e}")
+                raise RuntimeError(f"Could not connect to Outlook: {e}") from e
             
             try:
                 namespace = outlook.GetNamespace("MAPI")
             except Exception as e:
-                raise Exception(f"Could not access MAPI namespace: {e}")
+                raise RuntimeError(f"Could not access MAPI namespace: {e}") from e
             
             self._cleanup_stale_stores(namespace)
             
@@ -599,7 +601,7 @@ class EmlToPstConverter:
                 
             pst_store = self._find_pst_store(namespace, pst_path)
             if not pst_store:
-                raise Exception(f"Could not access PST file after creation. Path: {pst_path}")
+                raise RuntimeError(f"Could not access PST file after creation. Path: {pst_path}")
                 
             root_folder = pst_store.GetRootFolder()
             target_folder = self._get_or_create_inbox(root_folder)
@@ -646,12 +648,12 @@ class EmlToPstConverter:
                 try:
                     root = store.GetRootFolder()
                     namespace.RemoveStore(root)
-                    logger.info(f"Removed stale store reference: {file_path}")
+                    logger.info("Removed stale store reference: %s", file_path)
                 except Exception as e:
-                    logger.warning(f"Could not remove stale store {file_path}: {e}")
+                    logger.warning("Could not remove stale store %s: %s", file_path, e)
                     
         except Exception as e:
-            logger.debug(f"Stale store cleanup failed: {e}")
+            logger.debug("Stale store cleanup failed: %s", e)
     
     def _setup_pst_store(self, outlook, namespace, pst_path):
         """Create or open PST store"""
@@ -665,7 +667,7 @@ class EmlToPstConverter:
                     try:
                         os.remove(pst_path)
                     except OSError as e:
-                        logger.warning(f"Could not remove existing PST: {e}")
+                        logger.warning("Could not remove existing PST: %s", e)
                 
                 # Create PST using AddStoreEx (creates Unicode PST)
                 self._create_new_pst(outlook, namespace, pst_path)
@@ -677,7 +679,7 @@ class EmlToPstConverter:
         except FileNotFoundError:
             raise
         except Exception as e:
-            raise Exception(f"Could not create/open PST file: {e}")
+            raise RuntimeError(f"Could not create/open PST file: {e}") from e
     
     def _remove_existing_store(self, namespace, pst_path):
         """Remove any existing store reference with the given path"""
@@ -697,30 +699,30 @@ class EmlToPstConverter:
             try:
                 root = store.GetRootFolder()
                 namespace.RemoveStore(root)
-                logger.info(f"Removed existing store reference: {pst_path}")
+                logger.info("Removed existing store reference: %s", pst_path)
                 time.sleep(0.5)
             except Exception as e:
-                logger.warning(f"Could not remove store reference: {e}")
+                logger.warning("Could not remove store reference: %s", e)
     
     def _create_new_pst(self, outlook, namespace, pst_path):
         """Create a new PST file using the most reliable method"""
         # Method 1: Try AddStoreEx (preferred - creates Unicode PST)
         try:
             namespace.AddStoreEx(pst_path, OL_STORE_UNICODE)
-            logger.info(f"Created PST using AddStoreEx: {pst_path}")
+            logger.info("Created PST using AddStoreEx: %s", pst_path)
             return
         except AttributeError:
             logger.debug("AddStoreEx not available (older Outlook version)")
         except Exception as e1:
-            logger.debug(f"AddStoreEx failed: {e1}")
+            logger.debug("AddStoreEx failed: %s", e1)
         
         # Method 2: Try AddStore
         try:
             namespace.AddStore(pst_path)
-            logger.info(f"Created PST using AddStore: {pst_path}")
+            logger.info("Created PST using AddStore: %s", pst_path)
             return
         except Exception as e2:
-            logger.debug(f"AddStore failed: {e2}")
+            logger.debug("AddStore failed: %s", e2)
         
         # Method 3: Initialize Outlook with a temp item, then try AddStore
         try:
@@ -736,14 +738,14 @@ class EmlToPstConverter:
                     if item.EntryID == entry_id:
                         item.Delete()
                         break
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Could not purge temp item from Deleted Items: %s", e)
             
             namespace.AddStore(pst_path)
-            logger.info(f"Created PST using AddStore after init: {pst_path}")
+            logger.info("Created PST using AddStore after init: %s", pst_path)
             return
         except Exception as e3:
-            logger.debug(f"Method 3 failed: {e3}")
+            logger.debug("Method 3 failed: %s", e3)
         
         raise RuntimeError(
             "Could not create PST file. Please try:\n"
@@ -767,7 +769,7 @@ class EmlToPstConverter:
             # Wait and retry if not found
             if attempt < retries - 1:
                 time.sleep(1)
-                logger.debug(f"PST store not found, retry {attempt + 2}/{retries}")
+                logger.debug("PST store not found, retry %d/%d", attempt + 2, retries)
         
         return None
     
@@ -803,7 +805,7 @@ class EmlToPstConverter:
             except Exception as e:
                 errors += 1
                 error_messages.append(f"{current_file}: {e}")
-                logger.error(f"Error processing {file_path}: {e}")
+                logger.error("Error processing %s: %s", file_path, e)
                 
             # Update progress - capture i properly
             self.root.after(0, lambda v=i+1: self.progress.config(value=v))
@@ -811,9 +813,9 @@ class EmlToPstConverter:
         # Verify items were added
         try:
             item_count = target_folder.Items.Count
-            logger.info(f"Target folder now contains {item_count} items")
+            logger.info("Target folder now contains %d items", item_count)
         except (AttributeError, OSError) as e:
-            logger.debug(f"Could not get item count: {e}")
+            logger.debug("Could not get item count: %s", e)
         
         return converted, skipped, errors, error_messages
     
@@ -822,10 +824,11 @@ class EmlToPstConverter:
         # Check for duplicates
         if self.remove_duplicates.get():
             file_hash = self.get_email_hash(file_path)
-            if file_hash and file_hash in self.processed_hashes:
-                return "skipped"
             if file_hash:
-                self.processed_hashes.add(file_hash)
+                with self._lock:
+                    if file_hash in self.processed_hashes:
+                        return "skipped"
+                    self.processed_hashes.add(file_hash)
         
         # Method 1: Try OpenSharedItem and move directly to target folder
         try:
@@ -836,7 +839,7 @@ class EmlToPstConverter:
             moved_item.Save()
             return "converted"
         except Exception as e1:
-            logger.debug(f"OpenSharedItem failed for {file_path}: {e1}")
+            logger.debug("OpenSharedItem failed for %s: %s", file_path, e1)
         
         # Method 2: Create mail item using Outlook.CreateItem and copy to target
         try:
@@ -863,7 +866,7 @@ class EmlToPstConverter:
                 if email_data.get('from'):
                     mail.SentOnBehalfOfName = str(email_data['from'])
             except (AttributeError, TypeError) as e:
-                logger.debug(f"Could not set sender: {e}")
+                logger.debug("Could not set sender: %s", e)
             
             # Add attachments
             self._add_attachments(mail, email_data.get('attachments', []))
@@ -875,7 +878,7 @@ class EmlToPstConverter:
             
             return "converted"
         except Exception as e2:
-            logger.debug(f"Method 2 failed for {file_path}: {e2}")
+            logger.debug("Method 2 failed for %s: %s", file_path, e2)
             return str(e2)
     
     def _add_attachments(self, mail, attachments):
@@ -891,7 +894,8 @@ class EmlToPstConverter:
                 _, ext = os.path.splitext(safe_filename)
                 
                 fd, temp_path = tempfile.mkstemp(suffix=ext, prefix=f"eml_att_{uuid.uuid4().hex[:8]}_")
-                self._temp_files.append(temp_path)
+                with self._lock:
+                    self._temp_files.append(temp_path)
                 try:
                     os.write(fd, att['data'])
                 finally:
@@ -899,22 +903,23 @@ class EmlToPstConverter:
                 
                 mail.Attachments.Add(temp_path)
             except (OSError, IOError) as e:
-                logger.warning(f"Could not add attachment {att.get('filename')}: {e}")
+                logger.warning("Could not add attachment %s: %s", att.get('filename'), e)
             finally:
                 if temp_path and os.path.exists(temp_path):
                     try:
                         os.remove(temp_path)
-                        if temp_path in self._temp_files:
-                            self._temp_files.remove(temp_path)
-                    except OSError:
-                        pass
+                        with self._lock:
+                            if temp_path in self._temp_files:
+                                self._temp_files.remove(temp_path)
+                    except OSError as e:
+                        logger.debug("Could not remove temp file %s: %s", temp_path, e)
         
     def show_completion(self, converted, skipped, errors, note=""):
         """Show completion message"""
         self.status_label.config(text="Conversion Complete")
         self.progress.config(value=self.progress['maximum'])
         
-        msg = f"Conversion Complete!\n\n"
+        msg = "Conversion Complete!\n\n"
         msg += f"Converted: {converted} files\n"
         msg += f"Skipped (duplicates): {skipped} files\n"
         msg += f"Errors: {errors} files"
