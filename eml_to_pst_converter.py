@@ -16,10 +16,22 @@ import subprocess
 import sys
 import time
 import re
+import gc
 import logging
 import tempfile
 import uuid
 import atexit
+from pathlib import Path
+from email.utils import parsedate_to_datetime
+
+from i18n import (
+    LANG_EN,
+    LANG_HU,
+    LANGUAGE_NAMES,
+    detect_default_lang,
+    lang_from_display,
+    t,
+)
 
 # Configure logging
 logging.basicConfig(
@@ -40,24 +52,80 @@ INBOX_FOLDER_NAME = "Inbox"
 OUTLOOK_AVAILABLE = False
 WIN32COM = None
 PYTHONCOM = None
+PYWINTYPES = None
 try:
     import win32com.client
     import pythoncom
     WIN32COM = win32com.client
     PYTHONCOM = pythoncom
     OUTLOOK_AVAILABLE = True
+    try:
+        import pywintypes as _pywintypes
+        PYWINTYPES = _pywintypes
+    except ImportError:
+        pass
 except ImportError:
     logger.warning("pywin32 not available - PST conversion will require installation")
 
 # Maximum files to process (memory safety)
 MAX_FILES = 50000
+def _env_int_mb(name: str, default: int = 100, *, lo: int = 1, hi: int = 2048) -> int:
+    try:
+        v = int(os.environ.get(name, str(default)).strip())
+        return max(lo, min(v, hi))
+    except (TypeError, ValueError):
+        return default
+
+
+# Single-message read cap (mitigates huge / malicious .eml memory use)
+MAX_EML_FILE_BYTES = _env_int_mb("EML2PST_MAX_FILE_MB", 100) * 1024 * 1024
+
+
+def _env_float(name: str, default: float, *, lo: float = 0.0, hi: float = 600.0) -> float:
+    """Parse optional float env; clamp to [lo, hi] to avoid abuse or typos."""
+    try:
+        v = float(os.environ.get(name, "").strip())
+        return max(lo, min(v, hi))
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_staging_subdir(raw: str | None, default: str = "EML2PST_Staging") -> str:
+    """
+    Single folder name only — env must not inject path traversal or drive letters.
+    """
+    s = (raw or default).strip()
+    if len(s) > 80:
+        s = s[:80]
+    if not s or s in (".", ".."):
+        return default
+    for bad in (os.sep, ".."):
+        if bad in s:
+            return default
+    if os.altsep and os.altsep in s:
+        return default
+    if ":" in s:  # Windows streams / drive-relative tricks
+        return default
+    if not re.match(r"^[\w.\- ]+$", s):
+        return default
+    return s
+
+
+# After native import, Outlook may still read the staging .eml from disk asynchronously.
+# Deleting it immediately causes "file may have been moved or deleted" (localized in HU/EN).
+# Staging files are kept until the batch ends; optional extra delay after COM release.
+_NATIVE_POST_BATCH_DELAY = _env_float("EML2PST_POST_BATCH_DELAY", 3.0)
+# Not a dot-folder: Outlook often fails to open file:/// URLs under ".something" paths.
+NATIVE_STAGING_SUBDIR = _safe_staging_subdir(os.environ.get("EML2PST_STAGING_SUBDIR"))
 
 
 class EmlToPstConverter:
     def __init__(self, root):
         self.root = root
         self.root.title("EML to PST Converter")
-        self.root.geometry("750x550")
+        # Default / min size: long HU/EN labels need room; bottom bar must stay visible.
+        self.root.geometry("880x720")
+        self.root.minsize(780, 640)
         self.root.resizable(True, True)
         self.root.configure(bg='#f0f0f0')
         
@@ -66,6 +134,11 @@ class EmlToPstConverter:
         self.destination_path = tk.StringVar()
         self.pst_option = tk.StringVar(value="new")
         self.remove_duplicates = tk.BooleanVar(value=False)
+        # Off by default: use manual fallback + Windows file mtime for time when checked.
+        self.strict_date_preservation = tk.BooleanVar(value=False)
+        # Explorer "Date modified" / "Módosítás dátuma" on the original .eml file.
+        self.use_file_mtime_for_date = tk.BooleanVar(value=True)
+        self.lang_var = tk.StringVar(value=LANGUAGE_NAMES[detect_default_lang()])
         self.file_pattern = tk.StringVar(value="*.eml")
         self.eml_files = []
         self.processed_hashes = set()
@@ -74,20 +147,87 @@ class EmlToPstConverter:
         self._lock = threading.Lock()
         self._is_converting = False
         self._temp_files = []
+        self._conversion_options = {}
+        # Native OpenSharedItem staging: paths kept until batch finishes (Outlook async read).
+        self._native_staging_paths = []
+        self._staging_dir = None  # set per run; folder next to target PST
         
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         atexit.register(self._cleanup_temp_files)
         
         self.create_widgets()
-        
+        self.apply_language()
+
+    def _current_lang(self) -> str:
+        return lang_from_display(self.lang_var.get())
+
+    def apply_language(self, _event=None):
+        """Refresh all UI strings (English / Hungarian)."""
+        lang = self._current_lang()
+        self.root.title(t(lang, "window_title"))
+
+        self._lf_folder.config(text=t(lang, "folder_section"))
+        self._lf_pst.config(text=t(lang, "save_pst_section"))
+        self._lf_list.config(text=t(lang, "eml_files_section"))
+        self._btn_add.config(text=t(lang, "add_files"))
+        self._lbl_pattern.config(text=t(lang, "file_pattern_label"))
+        self._lbl_pattern_hint.config(text=t(lang, "file_pattern_hint"))
+        self._rb_new.config(text=t(lang, "create_new_pst"))
+        self._rb_existing.config(text=t(lang, "save_existing_pst"))
+        self._cb_dup.config(text=t(lang, "remove_duplicates"))
+        self._cb_strict.config(text=t(lang, "strict_date_preservation"))
+        explorer = t(lang, "explorer_date_modified")
+        self._cb_mtime.config(text=t(lang, "use_file_mtime", explorer=explorer))
+        self.file_tree.heading("name", text=t(lang, "col_name"))
+        self.file_tree.heading("path", text=t(lang, "col_path"))
+        self.file_tree.heading("size", text=t(lang, "col_size"))
+        self.file_tree.heading("date", text=t(lang, "col_date"))
+        self.update_file_count()
+        self._lbl_dest.config(text=t(lang, "destination_label"))
+        self._btn_browse_dest.config(text=t(lang, "browse_destination"))
+        self._btn_exit.config(text=t(lang, "btn_exit"))
+        self._btn_convert.config(text=t(lang, "btn_convert"))
+        self._lbl_lang.config(text=t(lang, "language_label"))
+
+        try:
+            self.context_menu.entryconfig(0, label=t(lang, "context_remove"))
+            self.context_menu.entryconfig(1, label=t(lang, "context_clear_all"))
+        except tk.TclError:
+            pass
+
+        with self._lock:
+            if not self._is_converting:
+                self.status_label.config(text=t(lang, "status_ready"))
+
     def create_widgets(self):
-        # Main frame with padding
+        # Main frame: grid so the file list absorbs shrink/grow; dest + buttons stay visible.
         main_frame = ttk.Frame(self.root, padding="10")
-        main_frame.pack(fill=tk.BOTH, expand=True)
+        main_frame.grid(row=0, column=0, sticky="nsew")
+        self.root.grid_rowconfigure(0, weight=1)
+        self.root.grid_columnconfigure(0, weight=1)
+        main_frame.grid_columnconfigure(0, weight=1)
+        # Row 3 = file list label frame — only this row expands vertically.
+        main_frame.grid_rowconfigure(3, weight=1)
+
+        # Language (Nyelv)
+        lang_row = ttk.Frame(main_frame)
+        lang_row.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        self._lbl_lang = ttk.Label(lang_row, text="")
+        self._lbl_lang.pack(side=tk.LEFT)
+        lang_combo = ttk.Combobox(
+            lang_row,
+            textvariable=self.lang_var,
+            values=(LANGUAGE_NAMES[LANG_EN], LANGUAGE_NAMES[LANG_HU]),
+            state="readonly",
+            width=12,
+        )
+        lang_combo.pack(side=tk.LEFT, padx=(6, 0))
+        lang_combo.bind("<<ComboboxSelected>>", self.apply_language)
         
         # === Add Folder Section ===
-        folder_frame = ttk.LabelFrame(main_frame, text="Add Folder Having *.eml / *.emlx Files", padding="10")
-        folder_frame.pack(fill=tk.X, pady=(0, 10))
+        self._lf_folder = ttk.LabelFrame(main_frame, text="", padding="10")
+        self._lf_folder.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        folder_frame = self._lf_folder
         
         # Folder path entry and browse
         path_frame = ttk.Frame(folder_frame)
@@ -96,140 +236,192 @@ class EmlToPstConverter:
         self.folder_entry = ttk.Entry(path_frame, textvariable=self.folder_path, width=70)
         self.folder_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10))
         
-        add_files_btn = ttk.Button(path_frame, text="Add Files", command=self.browse_folder)
-        add_files_btn.pack(side=tk.RIGHT)
+        self._btn_add = ttk.Button(path_frame, text="", command=self.browse_folder)
+        self._btn_add.pack(side=tk.RIGHT)
         
         # Wildcard pattern frame
         pattern_frame = ttk.Frame(folder_frame)
         pattern_frame.pack(fill=tk.X, pady=(5, 0))
         
-        ttk.Label(pattern_frame, text="File Pattern:").pack(side=tk.LEFT)
+        self._lbl_pattern = ttk.Label(pattern_frame, text="")
+        self._lbl_pattern.pack(side=tk.LEFT)
         
         pattern_combo = ttk.Combobox(pattern_frame, textvariable=self.file_pattern, width=15)
         pattern_combo['values'] = ('*.eml', '*.emlx', '*.eml;*.emlx')
         pattern_combo.pack(side=tk.LEFT, padx=(5, 10))
         
-        ttk.Label(pattern_frame, text="(Wildcards: * for any characters, ? for single character)").pack(side=tk.LEFT)
+        self._lbl_pattern_hint = ttk.Label(pattern_frame, text="")
+        self._lbl_pattern_hint.pack(side=tk.LEFT)
         
         # === Save in PST Section ===
-        pst_frame = ttk.LabelFrame(main_frame, text="Save in PST", padding="10")
-        pst_frame.pack(fill=tk.X, pady=(0, 10))
+        self._lf_pst = ttk.LabelFrame(main_frame, text="", padding="10")
+        self._lf_pst.grid(row=2, column=0, sticky="ew", pady=(0, 10))
+        pst_frame = self._lf_pst
         
         options_frame = ttk.Frame(pst_frame)
         options_frame.pack(fill=tk.X)
         
-        ttk.Radiobutton(options_frame, text="Create New PST File", 
-                       variable=self.pst_option, value="new").pack(side=tk.LEFT, padx=(0, 20))
-        ttk.Radiobutton(options_frame, text="Saving in Existing PST File", 
-                       variable=self.pst_option, value="existing").pack(side=tk.LEFT, padx=(0, 20))
-        ttk.Checkbutton(options_frame, text="Remove Duplicate Content", 
-                       variable=self.remove_duplicates).pack(side=tk.LEFT)
+        self._rb_new = ttk.Radiobutton(
+            options_frame, text="", variable=self.pst_option, value="new"
+        )
+        self._rb_new.pack(side=tk.LEFT, padx=(0, 20))
+        self._rb_existing = ttk.Radiobutton(
+            options_frame, text="", variable=self.pst_option, value="existing"
+        )
+        self._rb_existing.pack(side=tk.LEFT, padx=(0, 20))
+        self._cb_dup = ttk.Checkbutton(
+            options_frame, text="", variable=self.remove_duplicates
+        )
+        self._cb_dup.pack(side=tk.LEFT)
+        self._cb_strict = ttk.Checkbutton(
+            options_frame,
+            text="",
+            variable=self.strict_date_preservation,
+        )
+        self._cb_strict.pack(side=tk.LEFT, padx=(20, 0))
+
+        pst_options_row2 = ttk.Frame(pst_frame)
+        pst_options_row2.pack(fill=tk.X, pady=(6, 0))
+        self._cb_mtime = ttk.Checkbutton(
+            pst_options_row2,
+            text="",
+            variable=self.use_file_mtime_for_date,
+        )
+        self._cb_mtime.pack(side=tk.LEFT)
         
         # === File List Section ===
-        list_frame = ttk.LabelFrame(main_frame, text="EML/EMLX Files", padding="10")
-        list_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
-        
+        self._lf_list = ttk.LabelFrame(main_frame, text="", padding="10")
+        self._lf_list.grid(row=3, column=0, sticky="nsew", pady=(0, 10))
+        list_frame = self._lf_list
+        list_frame.grid_rowconfigure(0, weight=1)
+        list_frame.grid_columnconfigure(0, weight=1)
+
         # Create Treeview with scrollbars
         tree_container = ttk.Frame(list_frame)
-        tree_container.pack(fill=tk.BOTH, expand=True)
+        tree_container.grid(row=0, column=0, sticky="nsew")
         
         # Scrollbars
+        tree_container.grid_rowconfigure(0, weight=1)
+        tree_container.grid_columnconfigure(0, weight=1)
+
         y_scroll = ttk.Scrollbar(tree_container, orient=tk.VERTICAL)
-        y_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        y_scroll.grid(row=0, column=1, sticky="ns")
         
         x_scroll = ttk.Scrollbar(tree_container, orient=tk.HORIZONTAL)
-        x_scroll.pack(side=tk.BOTTOM, fill=tk.X)
+        x_scroll.grid(row=1, column=0, sticky="ew")
         
-        # Treeview
+        # Treeview (height= rows; grid gives remaining space so list scales with window)
         self.file_tree = ttk.Treeview(tree_container, columns=("name", "path", "size", "date"),
-                                       show="headings", height=10,
+                                       show="headings", height=8,
                                        yscrollcommand=y_scroll.set,
                                        xscrollcommand=x_scroll.set)
         
-        self.file_tree.heading("name", text="EML/EMLX Name")
-        self.file_tree.heading("path", text="Path")
-        self.file_tree.heading("size", text="Size")
-        self.file_tree.heading("date", text="Date Modified")
+        self.file_tree.heading("name", text="")
+        self.file_tree.heading("path", text="")
+        self.file_tree.heading("size", text="")
+        self.file_tree.heading("date", text="")
         
         self.file_tree.column("name", width=200, minwidth=150)
         self.file_tree.column("path", width=300, minwidth=200)
         self.file_tree.column("size", width=80, minwidth=60)
         self.file_tree.column("date", width=120, minwidth=100)
         
-        self.file_tree.pack(fill=tk.BOTH, expand=True)
+        self.file_tree.grid(row=0, column=0, sticky="nsew")
         
         y_scroll.config(command=self.file_tree.yview)
         x_scroll.config(command=self.file_tree.xview)
         
         # File count label
-        self.file_count_label = ttk.Label(list_frame, text="Total Files: 0")
-        self.file_count_label.pack(anchor=tk.W, pady=(5, 0))
+        self.file_count_label = ttk.Label(list_frame, text="")
+        self.file_count_label.grid(row=1, column=0, sticky="w", pady=(5, 0))
         
         # Context menu for treeview
         self.context_menu = tk.Menu(self.root, tearoff=0)
-        self.context_menu.add_command(label="Remove Selected", command=self.remove_selected)
-        self.context_menu.add_command(label="Clear All", command=self.clear_all)
+        self.context_menu.add_command(label="", command=self.remove_selected)
+        self.context_menu.add_command(label="", command=self.clear_all)
         self.file_tree.bind("<Button-3>", self.show_context_menu)
         
         # === Destination Section ===
         dest_frame = ttk.Frame(main_frame)
-        dest_frame.pack(fill=tk.X, pady=(0, 10))
+        dest_frame.grid(row=4, column=0, sticky="ew", pady=(0, 10))
         
-        ttk.Label(dest_frame, text="Destination:").pack(side=tk.LEFT)
+        self._lbl_dest = ttk.Label(dest_frame, text="")
+        self._lbl_dest.pack(side=tk.LEFT)
         
         self.dest_entry = ttk.Entry(dest_frame, textvariable=self.destination_path, width=60)
         self.dest_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(5, 10))
         
-        browse_dest_btn = ttk.Button(dest_frame, text="Browse Destination", command=self.browse_destination)
-        browse_dest_btn.pack(side=tk.RIGHT)
+        self._btn_browse_dest = ttk.Button(
+            dest_frame, text="", command=self.browse_destination
+        )
+        self._btn_browse_dest.pack(side=tk.RIGHT)
         
         # === Bottom Buttons ===
         button_frame = ttk.Frame(main_frame)
-        button_frame.pack(fill=tk.X, pady=(10, 0))
+        button_frame.grid(row=5, column=0, sticky="ew", pady=(10, 0))
         
         # Progress bar
         self.progress = ttk.Progressbar(button_frame, mode='determinate')
         self.progress.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10))
         
         # Status label
-        self.status_label = ttk.Label(button_frame, text="Ready")
+        self.status_label = ttk.Label(button_frame, text="")
         self.status_label.pack(side=tk.LEFT, padx=(0, 20))
         
         # Convert and Exit buttons
-        exit_btn = ttk.Button(button_frame, text="Exit", command=self._on_close, width=10)
-        exit_btn.pack(side=tk.RIGHT, padx=(5, 0))
+        self._btn_exit = ttk.Button(
+            button_frame, text="", command=self._on_close, width=10
+        )
+        self._btn_exit.pack(side=tk.RIGHT, padx=(5, 0))
         
-        self.convert_btn = ttk.Button(button_frame, text="Convert", command=self.start_conversion, width=10)
+        self.convert_btn = ttk.Button(
+            button_frame, text="", command=self.start_conversion, width=10
+        )
         self.convert_btn.pack(side=tk.RIGHT)
+        self._btn_convert = self.convert_btn
         
     def browse_folder(self):
         """Browse for folder containing EML/EMLX files"""
-        folder = filedialog.askdirectory(title="Select Folder Containing EML/EMLX Files")
+        folder = filedialog.askdirectory(
+            title=t(self._current_lang(), "dialog_select_folder")
+        )
         if folder:
             self.folder_path.set(folder)
-            # Run folder scan in background thread to prevent UI freeze
-            thread = threading.Thread(target=self._scan_folder_thread, args=(folder,))
+            lang = self._current_lang()
+            # Snapshot pattern on UI thread — Tk StringVar must not be read from workers.
+            pattern_snapshot = self.file_pattern.get()
+            thread = threading.Thread(
+                target=self._scan_folder_thread,
+                args=(folder, lang, pattern_snapshot),
+            )
             thread.daemon = True
             thread.start()
     
-    def _scan_folder_thread(self, folder):
+    def _scan_folder_thread(self, folder, lang, pattern_snapshot):
         """Background thread for folder scanning"""
-        self.root.after(0, lambda: self.status_label.config(text="Scanning folder..."))
+        self.root.after(
+            0,
+            lambda: self.status_label.config(text=t(lang, "status_scanning")),
+        )
         
         try:
-            files = self._scan_folder_impl(folder)
-            self.root.after(0, lambda: self._add_files_to_list(files))
+            files = self._scan_folder_impl(folder, lang, pattern_snapshot)
+            self.root.after(0, lambda: self._add_files_to_list(files, lang))
         except Exception as e:
             logger.error("Error scanning folder: %s", e)
-            self.root.after(0, lambda: messagebox.showerror("Error", f"Error scanning folder: {e}"))
+            self.root.after(
+                0,
+                lambda err=str(e), lg=lang: messagebox.showerror(
+                    t(lg, "title_error"),
+                    t(lg, "err_scan", err=err),
+                ),
+            )
             
-    def _scan_folder_impl(self, folder):
+    def _scan_folder_impl(self, folder, lang, pattern_input):
         """Scan folder for EML/EMLX files using wildcard pattern"""
-        pattern_input = self.file_pattern.get()
-        
         # Validate pattern - only allow safe patterns
         if not self._is_valid_pattern(pattern_input):
-            raise ValueError("Invalid file pattern. Only *.eml, *.emlx patterns are allowed.")
+            raise ValueError(t(lang, "err_invalid_pattern"))
         
         patterns = pattern_input.split(';')
         found_files = []
@@ -273,13 +465,15 @@ class EmlToPstConverter:
                 return False
         return True
     
-    def _add_files_to_list(self, files):
+    def _add_files_to_list(self, files, lang=None):
         """Add files to the treeview (runs on main thread)"""
+        if lang is None:
+            lang = self._current_lang()
         for file_path in files:
             self.add_file_to_list(file_path)
             
         self.update_file_count()
-        self.status_label.config(text=f"Found {len(files)} files")
+        self.status_label.config(text=t(lang, "status_found", n=len(files)))
             
     def add_file_to_list(self, file_path):
         """Add a file to the treeview list"""
@@ -314,7 +508,8 @@ class EmlToPstConverter:
     def update_file_count(self):
         """Update the file count label"""
         count = len(self.file_tree.get_children())
-        self.file_count_label.config(text=f"Total Files: {count}")
+        lang = self._current_lang()
+        self.file_count_label.config(text=t(lang, "total_files", n=count))
         
     def show_context_menu(self, event):
         """Show context menu on right-click"""
@@ -342,16 +537,19 @@ class EmlToPstConverter:
         
     def browse_destination(self):
         """Browse for destination PST file"""
+        lang = self._current_lang()
+        pst_type = (t(lang, "dialog_filetype_pst"), "*.pst")
+        all_type = (t(lang, "dialog_all_files"), "*.*")
         if self.pst_option.get() == "new":
             file_path = filedialog.asksaveasfilename(
-                title="Save PST File",
+                title=t(lang, "dialog_save_pst"),
                 defaultextension=".pst",
-                filetypes=[("Outlook PST Files", "*.pst"), ("All Files", "*.*")]
+                filetypes=[pst_type, all_type],
             )
         else:
             file_path = filedialog.askopenfilename(
-                title="Select Existing PST File",
-                filetypes=[("Outlook PST Files", "*.pst"), ("All Files", "*.*")]
+                title=t(lang, "dialog_open_pst"),
+                filetypes=[pst_type, all_type],
             )
         
         if file_path:
@@ -370,7 +568,11 @@ class EmlToPstConverter:
             return None
             
     def parse_eml(self, file_path):
-        """Parse an EML file and return email data"""
+        """
+        Parse an EML file and return email data.
+        Uses the stdlib parser so all MIME headers (Date, Received chain, etc.)
+        stay available for transport-header and date preservation in Outlook.
+        """
         try:
             with open(file_path, 'rb') as f:
                 msg = BytesParser(policy=policy.default).parse(f)
@@ -448,15 +650,20 @@ class EmlToPstConverter:
         
     def _on_close(self):
         """Handle window close with proper cleanup"""
+        lang = self._current_lang()
         with self._lock:
             if self._is_converting:
-                if not messagebox.askyesno("Confirm", "Conversion in progress. Exit anyway?"):
+                if not messagebox.askyesno(
+                    t(lang, "confirm_exit_title"),
+                    t(lang, "confirm_exit_msg"),
+                ):
                     return
         self._cleanup_temp_files()
         self.root.destroy()
     
     def _cleanup_temp_files(self):
         """Remove any leftover temp files created during attachment handling"""
+        self._cleanup_native_staging_files()
         with self._lock:
             paths = list(self._temp_files)
             self._temp_files.clear()
@@ -466,46 +673,126 @@ class EmlToPstConverter:
                     os.remove(path)
             except OSError as e:
                 logger.debug("Could not remove temp file %s: %s", path, e)
+
+    def _ensure_native_staging_dir(self, pst_path: str) -> str:
+        """Folder beside PST for staging (non-hidden name; Outlook-friendly)."""
+        base = os.path.dirname(os.path.abspath(pst_path))
+        if not base:
+            base = os.getcwd()
+        staging = os.path.join(base, NATIVE_STAGING_SUBDIR)
+        os.makedirs(staging, exist_ok=True)
+        return staging
+
+    def _native_temp_staging_dirs(self, source_file_path: str) -> list:
+        """
+        Directories to try for normalized .eml staging, in order:
+        1) Beside the source .eml (same access as the file user added)
+        2) Beside the target PST
+        3) System temp
+        """
+        dirs = []
+        src_root = os.path.dirname(os.path.abspath(source_file_path))
+        if src_root and os.path.isdir(src_root):
+            d = os.path.join(src_root, NATIVE_STAGING_SUBDIR)
+            try:
+                os.makedirs(d, exist_ok=True)
+                dirs.append(d)
+            except OSError as e:
+                logger.debug("Could not create source staging dir %s: %s", d, e)
+        if self._staging_dir and os.path.isdir(self._staging_dir):
+            if self._staging_dir not in dirs:
+                dirs.append(self._staging_dir)
+        td = tempfile.gettempdir()
+        if td not in dirs:
+            dirs.append(td)
+        return dirs
+
+    def _purge_orphan_staging_eml(self, staging_dir: str) -> None:
+        """Remove leftover emlx_as_eml_*.eml from interrupted prior runs."""
+        try:
+            for name in os.listdir(staging_dir):
+                if name.startswith("emlx_as_eml_") and name.endswith(".eml"):
+                    p = os.path.join(staging_dir, name)
+                    try:
+                        os.remove(p)
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+
+    def _cleanup_native_staging_files(self) -> None:
+        """Delete deferred native-import staging files; drop from _temp_files."""
+        with self._lock:
+            paths = list(self._native_staging_paths)
+            self._native_staging_paths.clear()
+        for p in paths:
+            try:
+                if os.path.isfile(p):
+                    os.remove(p)
+            except OSError as e:
+                logger.debug("Could not remove native staging file %s: %s", p, e)
+            with self._lock:
+                if p in self._temp_files:
+                    self._temp_files.remove(p)
     
     def start_conversion(self):
         """Start the conversion process in a separate thread"""
+        lang = self._current_lang()
         with self._lock:
             if self._is_converting:
-                messagebox.showwarning("Warning", "Conversion already in progress!")
+                messagebox.showwarning(
+                    t(lang, "title_warning"), t(lang, "warn_in_progress")
+                )
                 return
             if not self.eml_files:
-                messagebox.showwarning("Warning", "No EML/EMLX files to convert!")
+                messagebox.showwarning(
+                    t(lang, "title_warning"), t(lang, "warn_no_files")
+                )
                 return
+            # Snapshot UI state on the main thread; worker threads must not read Tk variables.
+            self._conversion_options = {
+                "destination_path": os.path.abspath(self.destination_path.get().strip()),
+                "remove_duplicates": bool(self.remove_duplicates.get()),
+                "strict_date_preservation": bool(self.strict_date_preservation.get()),
+                "use_file_mtime_for_date": bool(self.use_file_mtime_for_date.get()),
+                "pst_option": self.pst_option.get(),
+                "lang": lang,
+            }
             self._is_converting = True
             
-        if not self.destination_path.get():
+        if not self._conversion_options["destination_path"]:
             with self._lock:
                 self._is_converting = False
-            messagebox.showwarning("Warning", "Please select a destination path!")
+            messagebox.showwarning(
+                t(lang, "title_warning"), t(lang, "warn_no_destination")
+            )
             return
         
-        dest_path = self.destination_path.get()
+        dest_path = self._conversion_options["destination_path"]
         dest_dir = os.path.dirname(os.path.abspath(dest_path))
         if not os.path.isdir(dest_dir):
             with self._lock:
                 self._is_converting = False
-            messagebox.showerror("Error", f"Destination directory does not exist: {dest_dir}")
+            messagebox.showerror(
+                t(lang, "title_error"),
+                t(lang, "err_dest_dir", path=dest_dir),
+            )
             return
             
         self.convert_btn.config(state='disabled')
         
-        thread = threading.Thread(target=self._convert_files_thread)
+        thread = threading.Thread(target=self._convert_files_thread, args=(self._conversion_options.copy(),))
         thread.daemon = True
         thread.start()
     
-    def _convert_files_thread(self):
+    def _convert_files_thread(self, conversion_options):
         """Thread wrapper for conversion with COM initialization"""
         com_initialized = False
         try:
             if PYTHONCOM:
                 PYTHONCOM.CoInitialize()
                 com_initialized = True
-            self.convert_files()
+            self.convert_files(conversion_options)
         finally:
             if com_initialized:
                 PYTHONCOM.CoUninitialize()
@@ -513,7 +800,7 @@ class EmlToPstConverter:
                 self._is_converting = False
             self.root.after(0, lambda: self.convert_btn.config(state='normal'))
         
-    def convert_files(self):
+    def convert_files(self, conversion_options):
         """Convert EML files to PST format"""
         with self._lock:
             total = len(self.eml_files)
@@ -530,27 +817,30 @@ class EmlToPstConverter:
         
         # Try to use Outlook COM for PST creation
         try:
-            self.convert_with_outlook(files_to_process)
+            self.convert_with_outlook(files_to_process, conversion_options)
         except Exception as e:
             error_msg = str(e)
             logger.error("Conversion error: %s", error_msg)
-            self.root.after(0, lambda: messagebox.showerror(
-                "Conversion Error",
-                f"Error during conversion:\n{error_msg}\n\n"
-                "Make sure Microsoft Outlook is installed and working properly."
-            ))
+            lg = conversion_options.get("lang", LANG_EN)
+
+            def _show_conv_err(err=error_msg, lang=lg):
+                messagebox.showerror(
+                    t(lang, "title_conversion_error"),
+                    t(lang, "msg_conversion_error", err=err),
+                )
+
+            self.root.after(0, _show_conv_err)
     
     def prompt_install_pywin32(self):
         """Prompt user to install pywin32"""
+        lang = self._current_lang()
         result = messagebox.askyesno(
-            "Missing Dependency",
-            "The 'pywin32' library is required for PST conversion.\n\n"
-            "Would you like to install it now?\n\n"
-            "(This requires an internet connection)"
+            t(lang, "title_missing_dep"),
+            t(lang, "msg_missing_dep"),
         )
         
         if result:
-            self.status_label.config(text="Installing pywin32...")
+            self.status_label.config(text=t(lang, "status_installing_pywin32"))
             self.root.update()
             
             try:
@@ -559,23 +849,39 @@ class EmlToPstConverter:
                     creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
                 )
                 messagebox.showinfo(
-                    "Installation Complete",
-                    "pywin32 has been installed successfully!\n\n"
-                    "Please restart the application to use PST conversion."
+                    t(lang, "title_install_ok"),
+                    t(lang, "msg_install_ok"),
                 )
             except subprocess.CalledProcessError as e:
                 logger.error("Failed to install pywin32: %s", e)
                 messagebox.showerror(
-                    "Installation Failed",
-                    "Failed to install pywin32.\n\n"
-                    "Please run manually in command prompt:\npip install pywin32"
+                    t(lang, "title_install_fail"),
+                    t(lang, "msg_install_fail"),
                 )
             
-            self.status_label.config(text="Ready")
+            self.status_label.config(text=t(lang, "status_ready"))
             
-    def convert_with_outlook(self, files_to_process):
+    def convert_with_outlook(self, files_to_process, conversion_options):
         """Convert using Outlook COM interface (requires Microsoft Outlook)"""
-        self._update_status("Connecting to Outlook...")
+        lang = conversion_options.get("lang", LANG_EN)
+        pst_path = conversion_options["destination_path"]
+        # Staging beside PST before COM (avoids stale dir; Outlook may block %TEMP%).
+        self._staging_dir = self._ensure_native_staging_dir(pst_path)
+        self._purge_orphan_staging_eml(self._staging_dir)
+        # Orphans beside source folders (same subdir name as beside PST).
+        seen_staging = {self._staging_dir}
+        for fp in files_to_process:
+            root = os.path.dirname(os.path.abspath(fp))
+            sd = os.path.join(root, NATIVE_STAGING_SUBDIR)
+            if sd in seen_staging:
+                continue
+            seen_staging.add(sd)
+            if os.path.isdir(sd):
+                self._purge_orphan_staging_eml(sd)
+        with self._lock:
+            self._native_staging_paths.clear()
+
+        self._update_status(t(lang, "status_connecting"))
         
         outlook = None
         namespace = None
@@ -590,12 +896,10 @@ class EmlToPstConverter:
             except Exception as e:
                 raise RuntimeError(f"Could not access MAPI namespace: {e}") from e
             
-            self._cleanup_stale_stores(namespace)
+            self._cleanup_stale_store_for_path(namespace, pst_path)
             
-            pst_path = os.path.abspath(self.destination_path.get())
-            
-            self._update_status("Creating PST file...")
-            self._setup_pst_store(outlook, namespace, pst_path)
+            self._update_status(t(lang, "status_creating_pst"))
+            self._setup_pst_store(outlook, namespace, pst_path, conversion_options)
             
             time.sleep(1)
                 
@@ -607,39 +911,62 @@ class EmlToPstConverter:
             target_folder = self._get_or_create_inbox(root_folder)
                 
             total = len(files_to_process)
-            converted, skipped, errors, error_messages = self._process_email_files(
-                outlook, namespace, target_folder, files_to_process, total
+            converted, skipped, errors, error_messages, skipped_messages = self._process_email_files(
+                outlook, namespace, target_folder, files_to_process, total, conversion_options
             )
             
-            note = f"\n\nPST saved to: {pst_path}"
+            note = t(lang, "note_pst_saved", path=pst_path)
             if error_messages:
-                note += "\n\nErrors:\n" + "\n".join(error_messages[:5])
+                note += t(lang, "note_errors") + "\n".join(error_messages[:5])
                 if len(error_messages) > 5:
-                    note += f"\n... and {len(error_messages) - 5} more errors"
+                    note += t(
+                        lang,
+                        "note_more_errors",
+                        n=len(error_messages) - 5,
+                    )
+            if skipped_messages:
+                note += t(lang, "note_skipped") + "\n".join(skipped_messages[:5])
+                if len(skipped_messages) > 5:
+                    note += t(
+                        lang,
+                        "note_more_skipped",
+                        n=len(skipped_messages) - 5,
+                    )
                 
-            self.root.after(0, lambda: self.show_completion(converted, skipped, errors, note))
+            self.root.after(
+                0,
+                lambda c=converted, s=skipped, e=errors, n=note, lg=lang: self.show_completion(
+                    c, s, e, n, lg
+                ),
+            )
         finally:
             # Release COM objects to prevent Outlook from hanging
-            del namespace
-            del outlook
-            import gc
+            try:
+                del namespace
+            except Exception:
+                pass
+            try:
+                del outlook
+            except Exception:
+                pass
             gc.collect()
+            time.sleep(max(0.0, _NATIVE_POST_BATCH_DELAY))
+            self._cleanup_native_staging_files()
     
     def _update_status(self, text):
         """Thread-safe status update"""
         self.root.after(0, lambda: self.status_label.config(text=text))
     
-    def _cleanup_stale_stores(self, namespace):
-        """Remove store references to PST files that no longer exist"""
+    def _cleanup_stale_store_for_path(self, namespace, pst_path):
+        """Remove stale store reference only for the target PST path."""
         try:
+            target = pst_path.lower()
             stale_stores = []
             for store in namespace.Stores:
                 try:
                     file_path = store.FilePath
-                    # Check if this is a PST file that no longer exists
-                    if file_path and file_path.lower().endswith('.pst'):
-                        if not os.path.exists(file_path):
-                            stale_stores.append((store, file_path))
+                    if file_path and file_path.lower() == target and not os.path.exists(file_path):
+                        stale_stores.append((store, file_path))
                 except (AttributeError, OSError):
                     continue
             
@@ -653,15 +980,15 @@ class EmlToPstConverter:
                     logger.warning("Could not remove stale store %s: %s", file_path, e)
                     
         except Exception as e:
-            logger.debug("Stale store cleanup failed: %s", e)
+            logger.debug("Target stale store cleanup failed: %s", e)
     
-    def _setup_pst_store(self, outlook, namespace, pst_path):
+    def _setup_pst_store(self, outlook, namespace, pst_path, conversion_options):
         """Create or open PST store"""
         try:
             # First, remove any existing store reference with this path
             self._remove_existing_store(namespace, pst_path)
             
-            if self.pst_option.get() == "new":
+            if conversion_options.get("pst_option") == "new":
                 # Remove existing file if present
                 if os.path.exists(pst_path):
                     try:
@@ -780,28 +1107,37 @@ class EmlToPstConverter:
                 return folder
         return root_folder.Folders.Add(INBOX_FOLDER_NAME)
     
-    def _process_email_files(self, outlook, namespace, target_folder, files_to_process, total):
+    def _process_email_files(self, outlook, namespace, target_folder, files_to_process, total, conversion_options):
         """Process all email files"""
         converted = 0
         skipped = 0
         errors = 0
         error_messages = []
+        skipped_messages = []
         
+        lang = conversion_options.get("lang", LANG_EN)
         for i, file_path in enumerate(files_to_process):
             current_file = os.path.basename(file_path)
-            # Capture i in closure properly
-            self.root.after(0, lambda f=current_file, idx=i: self.status_label.config(
-                text=f"Converting: {f} ({idx+1}/{total})"))
+            self.root.after(
+                0,
+                lambda f=current_file, idx=i, tot=total, lg=lang: self.status_label.config(
+                    text=t(lg, "status_converting", name=f, cur=idx + 1, total=tot)
+                ),
+            )
             
             try:
-                result = self._process_single_email(namespace, target_folder, file_path, outlook)
-                if result == "converted":
+                status, detail = self._process_single_email(
+                    namespace, target_folder, file_path, outlook, conversion_options
+                )
+                if status == "converted":
                     converted += 1
-                elif result == "skipped":
+                elif status == "skipped":
                     skipped += 1
+                    if detail:
+                        skipped_messages.append(f"{current_file}: {detail}")
                 else:
                     errors += 1
-                    error_messages.append(f"{current_file}: {result}")
+                    error_messages.append(f"{current_file}: {detail or 'Unknown error'}")
             except Exception as e:
                 errors += 1
                 error_messages.append(f"{current_file}: {e}")
@@ -817,41 +1153,95 @@ class EmlToPstConverter:
         except (AttributeError, OSError) as e:
             logger.debug("Could not get item count: %s", e)
         
-        return converted, skipped, errors, error_messages
+        return converted, skipped, errors, error_messages, skipped_messages
     
-    def _process_single_email(self, namespace, target_folder, file_path, outlook):
+    def _process_single_email(self, namespace, target_folder, file_path, outlook, conversion_options):
         """Process a single email file"""
+        try:
+            sz = os.path.getsize(file_path)
+            if sz > MAX_EML_FILE_BYTES:
+                mb = MAX_EML_FILE_BYTES // (1024 * 1024)
+                return (
+                    "error",
+                    f"File too large ({sz // (1024 * 1024)} MB); max {mb} MB (set EML2PST_MAX_FILE_MB)",
+                )
+        except OSError as e:
+            return "error", f"Cannot read file: {e}"
+
         # Check for duplicates
-        if self.remove_duplicates.get():
+        if conversion_options["remove_duplicates"]:
             file_hash = self.get_email_hash(file_path)
             if file_hash:
                 with self._lock:
                     if file_hash in self.processed_hashes:
-                        return "skipped"
+                        return "skipped", "Duplicate content"
                     self.processed_hashes.add(file_hash)
         
-        # Method 1: Try OpenSharedItem and move directly to target folder
-        try:
-            mail_item = namespace.OpenSharedItem(file_path)
-            # Move directly to target folder (returns the moved item)
-            moved_item = mail_item.Move(target_folder)
-            # Save to ensure it's persisted
-            moved_item.Save()
-            return "converted"
-        except Exception as e1:
-            logger.debug("OpenSharedItem failed for %s: %s", file_path, e1)
-        
-        # Method 2: Create mail item using Outlook.CreateItem and copy to target
+        # Method 1: Native Outlook import (best MIME preservation: full RFC822 in PST)
+        native_result = self._import_with_outlook_native(
+            namespace, target_folder, file_path, conversion_options
+        )
+        if native_result == "converted":
+            return "converted", ""
+        if conversion_options["strict_date_preservation"]:
+            logger.warning(
+                "Native import failed for %s; trying strict metadata fallback. Error: %s",
+                file_path,
+                native_result,
+            )
+            strict_result = self._process_single_email_manual_fallback(
+                file_path,
+                target_folder,
+                outlook,
+                require_date_preservation=True,
+                conversion_options=conversion_options,
+            )
+            if strict_result == "converted":
+                return "converted", ""
+            return "skipped", (
+                "Native import required to preserve original arrival date. "
+                f"Reason: {native_result}; strict fallback failed: {strict_result}"
+            )
+
+        logger.warning(
+            "Native import failed for %s; strict date preservation is OFF, using manual fallback. Error: %s",
+            file_path,
+            native_result,
+        )
+        fallback_result = self._process_single_email_manual_fallback(
+            file_path,
+            target_folder,
+            outlook,
+            require_date_preservation=False,
+            conversion_options=conversion_options,
+        )
+        if fallback_result == "converted":
+            return "converted", ""
+        return "error", fallback_result
+
+    def _process_single_email_manual_fallback(
+        self, file_path, target_folder, outlook, require_date_preservation, conversion_options
+    ):
+        """
+        Manual fallback import.
+        Writes PR_TRANSPORT_MESSAGE_HEADERS from the parsed message (MIME headers).
+        If strict (require_date_preservation): delivery time from Date/Received only;
+        if that fails, the message is skipped.
+        If not strict and "file mtime" is on: Windows modified time on the original
+        .eml is applied first for delivery/submit time; otherwise Date/Received, then mtime.
+        """
         try:
             email_data = self.parse_eml(file_path)
             if not email_data:
                 return "Could not parse email"
-            
-            # Create mail item in default location
+
             mail = outlook.CreateItem(OL_MAIL_ITEM)
-            
             mail.Subject = str(email_data['subject'] or "(No Subject)")
-            
+            if email_data.get('to'):
+                mail.To = str(email_data['to'])
+            if email_data.get('cc'):
+                mail.CC = str(email_data['cc'])
+
             body = email_data['body']
             if isinstance(body, str):
                 if '<html' in body.lower() or '<body' in body.lower():
@@ -860,26 +1250,487 @@ class EmlToPstConverter:
                     mail.Body = body
             else:
                 mail.Body = str(body) if body else ""
-            
-            # Try to set sender info (may fail if property is read-only)
+
             try:
                 if email_data.get('from'):
                     mail.SentOnBehalfOfName = str(email_data['from'])
             except (AttributeError, TypeError) as e:
                 logger.debug("Could not set sender: %s", e)
-            
-            # Add attachments
+
+            use_mtime = conversion_options.get("use_file_mtime_for_date", True)
+            prefer_mtime_first = not require_date_preservation and use_mtime
+            date_ok = self._apply_original_metadata(
+                mail,
+                email_data,
+                source_file_path=file_path,
+                use_file_mtime=use_mtime,
+                prefer_file_mtime_first=prefer_mtime_first,
+            )
+            if require_date_preservation and not date_ok:
+                return "Could not preserve original arrival date metadata"
+
             self._add_attachments(mail, email_data.get('attachments', []))
-            
-            # Save first, then move to target folder
+
             mail.Save()
             moved_mail = mail.Move(target_folder)
+            # Move into PST often resets Received/list times to "now"; re-apply on the stored item.
+            self._apply_original_metadata(
+                moved_mail,
+                email_data,
+                source_file_path=file_path,
+                use_file_mtime=use_mtime,
+                prefer_file_mtime_first=prefer_mtime_first,
+            )
             moved_mail.Save()
-            
             return "converted"
-        except Exception as e2:
-            logger.debug("Method 2 failed for %s: %s", file_path, e2)
-            return str(e2)
+        except Exception as e:
+            logger.debug("Manual fallback failed for %s: %s", file_path, e)
+            return str(e)
+
+    def _open_shared_item_candidates(self, file_path):
+        """
+        Outlook OpenSharedItem often rejects plain paths and returns
+        'Invalid path or URL'. Try short path and file:/// URI as well.
+        """
+        candidates = []
+        try:
+            abs_path = os.path.normpath(os.path.abspath(file_path))
+        except OSError:
+            abs_path = file_path
+
+        if os.path.isfile(abs_path):
+            # 1) Short path (helps with spaces / Unicode in path)
+            if OUTLOOK_AVAILABLE:
+                try:
+                    import win32api
+                    short = win32api.GetShortPathName(abs_path)
+                    if short and os.path.isfile(short):
+                        candidates.append(short)
+                except Exception as e:
+                    logger.debug("GetShortPathName skipped: %s", e)
+            # 2) Absolute path string
+            if abs_path not in candidates:
+                candidates.append(abs_path)
+            # 3) file:/// URI (Outlook COM often expects this)
+            try:
+                uri = Path(abs_path).resolve().as_uri()
+                if uri not in candidates:
+                    candidates.append(uri)
+            except Exception as e:
+                logger.debug("as_uri failed: %s", e)
+
+        # De-dupe preserving order
+        seen = set()
+        out = []
+        for c in candidates:
+            if c and c not in seen:
+                seen.add(c)
+                out.append(c)
+        return out
+
+    def _open_shared_item(self, namespace, file_path):
+        """Try OpenSharedItem with path variants; return mail item or raise last error."""
+        last_err = None
+        for candidate in self._open_shared_item_candidates(file_path):
+            try:
+                return namespace.OpenSharedItem(candidate)
+            except Exception as e:
+                last_err = e
+                logger.debug("OpenSharedItem failed for %r: %s", candidate, e)
+        if last_err:
+            raise last_err
+        raise OSError(f"Not a file or unreadable: {file_path}")
+
+    def _outlook_com_datetime(self, dt_naive: datetime):
+        """
+        Outlook often ignores Python datetime for MAPI / MailItem time fields;
+        pywintypes.Time is required for list columns (Received, etc.).
+        """
+        if dt_naive.tzinfo is not None:
+            dt_naive = dt_naive.astimezone().replace(tzinfo=None)
+        if PYWINTYPES:
+            try:
+                return PYWINTYPES.Time(dt_naive)
+            except Exception:
+                pass
+        return dt_naive
+
+    def _stamp_outlook_item_with_explorer_mtime(self, mail_item, source_eml_path: str) -> bool:
+        """
+        Set delivery/submit/creation-style MAPI times and MailItem.ReceivedTime /
+        SentOn from the source file's Windows last-write time (Explorer Date modified).
+        """
+        if not source_eml_path or not os.path.isfile(source_eml_path):
+            return False
+        try:
+            ts = os.path.getmtime(source_eml_path)
+            dt_local = datetime.fromtimestamp(ts)
+        except OSError as e:
+            logger.warning("Could not read mtime for %s: %s", source_eml_path, e)
+            return False
+
+        com_val = self._outlook_com_datetime(dt_local)
+        ok = False
+        # MAPI PT_SYSTIME tags the message list / sorting often use
+        mapi_time_urls = (
+            "http://schemas.microsoft.com/mapi/proptag/0x0E060040",  # PR_MESSAGE_DELIVERY_TIME
+            "http://schemas.microsoft.com/mapi/proptag/0x00390040",  # PR_CLIENT_SUBMIT_TIME
+            "http://schemas.microsoft.com/mapi/proptag/0x30070040",  # PR_CREATION_TIME
+            "http://schemas.microsoft.com/mapi/proptag/0x30080040",  # PR_LAST_MODIFICATION_TIME
+        )
+        try:
+            pa = mail_item.PropertyAccessor
+            for url in mapi_time_urls:
+                try:
+                    pa.SetProperty(url, com_val)
+                    ok = True
+                except Exception as e:
+                    logger.debug("SetProperty %s: %s", url, e)
+        except Exception as e:
+            logger.warning("PropertyAccessor unavailable for mtime stamp: %s", e)
+
+        try:
+            mail_item.ReceivedTime = com_val
+            ok = True
+        except Exception as e:
+            logger.debug("MailItem.ReceivedTime: %s", e)
+        try:
+            mail_item.SentOn = com_val
+            ok = True
+        except Exception as e:
+            logger.debug("MailItem.SentOn: %s", e)
+
+        if not ok:
+            logger.warning(
+                "Explorer mtime stamp had no effect for %s (Outlook may block writes)",
+                source_eml_path,
+            )
+        return ok
+
+    def _apply_original_metadata(
+        self,
+        mail,
+        email_data,
+        source_file_path=None,
+        use_file_mtime=True,
+        prefer_file_mtime_first=False,
+    ):
+        """
+        Preserve MIME headers and message time in Outlook (fallback path).
+
+        - PR_TRANSPORT_MESSAGE_HEADERS: full header block from the .eml.
+        - PR_MESSAGE_DELIVERY_TIME / PR_CLIENT_SUBMIT_TIME:
+          If prefer_file_mtime_first and use_file_mtime: Windows ``mtime`` on the
+          original file first (Explorer "Date modified"); else Date/Received headers,
+          then mtime as last resort.
+
+        Returns True if a message date was applied (header-based or mtime).
+        """
+        date_applied = False
+        try:
+            pa = mail.PropertyAccessor
+        except Exception as e:
+            logger.debug("PropertyAccessor unavailable: %s", e)
+            return False
+
+        try:
+            headers = self._build_transport_headers(email_data)
+            if headers:
+                try:
+                    pa.SetProperty("http://schemas.microsoft.com/mapi/proptag/0x007D001E", headers)
+                except Exception:
+                    # Unicode transport headers (some Outlook builds)
+                    pa.SetProperty("http://schemas.microsoft.com/mapi/proptag/0x007D001F", headers)
+        except Exception as e:
+            logger.debug("Could not set transport headers: %s", e)
+
+        def _apply_mtime_from_source():
+            nonlocal date_applied
+            if not use_file_mtime or not source_file_path:
+                return
+            try:
+                if os.path.isfile(source_file_path):
+                    ts = os.path.getmtime(source_file_path)
+                    dt_local = datetime.fromtimestamp(ts)
+                    com_val = self._outlook_com_datetime(dt_local)
+                    for url in (
+                        "http://schemas.microsoft.com/mapi/proptag/0x0E060040",
+                        "http://schemas.microsoft.com/mapi/proptag/0x00390040",
+                        "http://schemas.microsoft.com/mapi/proptag/0x30070040",
+                        "http://schemas.microsoft.com/mapi/proptag/0x30080040",
+                    ):
+                        try:
+                            pa.SetProperty(url, com_val)
+                        except Exception:
+                            pass
+                    try:
+                        mail.ReceivedTime = com_val
+                    except Exception:
+                        pass
+                    try:
+                        mail.SentOn = com_val
+                    except Exception:
+                        pass
+                    date_applied = True
+                    logger.info(
+                        "Applied delivery time from file modification time: %s",
+                        source_file_path,
+                    )
+            except Exception as e:
+                logger.debug("Could not apply file mtime as date: %s", e)
+
+        if prefer_file_mtime_first:
+            _apply_mtime_from_source()
+
+        if not date_applied:
+            try:
+                date_raw = self._first_parseable_date_header(email_data)
+                if date_raw:
+                    dt = parsedate_to_datetime(date_raw)
+                    if dt is not None:
+                        if dt.tzinfo is None:
+                            dt_local = dt
+                        else:
+                            dt_local = dt.astimezone().replace(tzinfo=None)
+                        com_val = self._outlook_com_datetime(dt_local)
+                        for url in (
+                            "http://schemas.microsoft.com/mapi/proptag/0x0E060040",
+                            "http://schemas.microsoft.com/mapi/proptag/0x00390040",
+                        ):
+                            try:
+                                pa.SetProperty(url, com_val)
+                            except Exception:
+                                pass
+                        try:
+                            mail.ReceivedTime = com_val
+                        except Exception:
+                            pass
+                        try:
+                            mail.SentOn = com_val
+                        except Exception:
+                            pass
+                        date_applied = True
+            except Exception as e:
+                logger.debug("Could not set original date properties: %s", e)
+
+        if not date_applied:
+            _apply_mtime_from_source()
+
+        return date_applied
+
+    def _first_parseable_date_header(self, email_data):
+        """
+        First usable instant for Outlook delivery/submit time.
+
+        Order: ``Date:``, then **each** ``Received:`` line (common in real mail;
+        msg.get('Received') only returns one), then Resent-Date / Delivery-Date.
+        """
+        msg = email_data.get("message")
+
+        def _parse_stamp(raw: str):
+            if not raw:
+                return None
+            raw = raw.strip()
+            try:
+                if parsedate_to_datetime(raw) is not None:
+                    return raw
+            except (TypeError, ValueError):
+                pass
+            return None
+
+        # Date:
+        raw = None
+        if msg is not None:
+            raw = msg.get("Date")
+        if not raw:
+            raw = email_data.get("date")
+        found = _parse_stamp(raw) if raw else None
+        if found:
+            return found
+
+        # Every Received: (hop chain); date is usually after the last ';'
+        if msg is not None:
+            received_vals = msg.get_all("Received") or []
+            if received_vals:
+                for rec in received_vals:
+                    candidate = rec
+                    if ";" in rec:
+                        candidate = rec.rsplit(";", 1)[-1].strip()
+                    found = _parse_stamp(candidate)
+                    if found:
+                        return found
+
+        for key in ("Resent-Date", "Delivery-Date"):
+            raw = msg.get(key) if msg is not None else None
+            if raw:
+                found = _parse_stamp(raw)
+                if found:
+                    return found
+
+        return email_data.get("date")
+
+    def _build_transport_headers(self, email_data):
+        """
+        Build RFC822 header block for PR_TRANSPORT_MESSAGE_HEADERS (MIME headers).
+
+        Prefer ``raw_items()`` so order and **repeated** headers (e.g. multiple
+        ``Received:``) match the source. Otherwise join ``get_all()`` per header
+        name so Received chains are not dropped.
+        """
+        msg = email_data.get("message")
+        if msg is None:
+            return ""
+        try:
+            if hasattr(msg, "raw_items"):
+                lines = [f"{k}: {v}" for (k, v) in msg.raw_items()]
+            else:
+                lines = []
+                for name in msg.keys():
+                    vals = msg.get_all(name)
+                    if not vals:
+                        continue
+                    for value in vals:
+                        lines.append(f"{name}: {value}")
+            if lines:
+                return "\r\n".join(lines) + "\r\n"
+        except Exception as e:
+            logger.debug("Could not build transport headers: %s", e)
+        return ""
+
+    def _import_with_outlook_native(self, namespace, target_folder, file_path, conversion_options):
+        """
+        Import via Outlook OpenSharedItem (best path for intact MIME: Date, Received
+        chain, Content-Type, etc. stay with the message as Outlook stored them).
+
+        If use_file_mtime_for_date is True, overwrites list-view times with the source
+        file's Explorer 'Date modified' so PST dates match the folder you picked files from.
+        If False, leaves Outlook's dates from the .eml content only.
+
+        For .emlx or malformed files, normalizes line endings to a staging .eml
+        without rewriting headers so MIME remains preserved.
+        """
+        use_explorer_mtime = conversion_options.get("use_file_mtime_for_date", True)
+
+        # 1) Direct native import first (.eml and some .emlx files)
+        try:
+            mail_item = self._open_shared_item(namespace, file_path)
+            moved_item = mail_item.Move(target_folder)
+            moved_item.Save()
+            # First Save often locks "Received" to import time; stamp then Save again.
+            if use_explorer_mtime:
+                self._stamp_outlook_item_with_explorer_mtime(moved_item, file_path)
+                moved_item.Save()
+            del mail_item
+            del moved_item
+            gc.collect()
+            return "converted"
+        except Exception as e:
+            logger.debug("OpenSharedItem direct failed for %s: %s", file_path, e)
+
+        # 2) Convert source to normalized RFC822 .eml and retry native import.
+        # This helps Outlook parse some malformed .eml exports while preserving headers/date.
+        ext = os.path.splitext(file_path)[1].lower()
+        try:
+            if ext == ".emlx":
+                rfc822_bytes = self._emlx_to_rfc822_bytes(file_path)
+            else:
+                with open(file_path, "rb") as f:
+                    rfc822_bytes = f.read()
+            if not rfc822_bytes:
+                return "Could not decode source message content"
+
+            rfc822_bytes = self._normalize_rfc822_line_endings(rfc822_bytes)
+
+            last_err = None
+            for staging_dir in self._native_temp_staging_dirs(file_path):
+                temp_eml_path = None
+                try:
+                    fd, temp_eml_path = tempfile.mkstemp(
+                        suffix=".eml",
+                        prefix=f"emlx_as_eml_{uuid.uuid4().hex[:8]}_",
+                        dir=staging_dir,
+                    )
+                    with self._lock:
+                        self._temp_files.append(temp_eml_path)
+                    try:
+                        os.write(fd, rfc822_bytes)
+                        os.fsync(fd)
+                    finally:
+                        os.close(fd)
+
+                    if not os.path.isfile(temp_eml_path):
+                        raise OSError(f"staging file missing after write: {temp_eml_path}")
+                    time.sleep(0.08)
+
+                    mail_item = self._open_shared_item(namespace, temp_eml_path)
+                    moved_item = mail_item.Move(target_folder)
+                    moved_item.Save()
+                    if use_explorer_mtime:
+                        self._stamp_outlook_item_with_explorer_mtime(moved_item, file_path)
+                        moved_item.Save()
+                    del mail_item
+                    del moved_item
+                    gc.collect()
+                    with self._lock:
+                        self._native_staging_paths.append(temp_eml_path)
+                    return "converted"
+                except Exception as e:
+                    last_err = e
+                    logger.debug(
+                        "RFC822 native import failed (staging_dir=%s): %s",
+                        staging_dir,
+                        e,
+                    )
+                    if temp_eml_path and os.path.exists(temp_eml_path):
+                        try:
+                            os.remove(temp_eml_path)
+                        except OSError:
+                            pass
+                        with self._lock:
+                            if temp_eml_path in self._temp_files:
+                                self._temp_files.remove(temp_eml_path)
+
+            return f"Native import failed after RFC822 normalization: {last_err}"
+        except Exception as e:
+            return f"Native import failed after RFC822 normalization: {e}"
+
+    def _normalize_rfc822_line_endings(self, data):
+        """Normalize RFC822 data to CRLF endings for better Outlook compatibility."""
+        if not data:
+            return data
+        normalized = data.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+        return b"\r\n".join(normalized.split(b"\n"))
+
+    def _emlx_to_rfc822_bytes(self, file_path):
+        """
+        Convert Apple .emlx to RFC822 .eml bytes.
+        .emlx is usually: <byte_count_line>\\n<rfc822_message><plist...>
+        """
+        try:
+            with open(file_path, "rb") as f:
+                data = f.read()
+        except OSError as e:
+            logger.debug("Could not read EMLX %s: %s", file_path, e)
+            return None
+
+        newline_idx = data.find(b"\n")
+        if newline_idx <= 0:
+            return data
+
+        first_line = data[:newline_idx].strip()
+        if not first_line.isdigit():
+            return data
+
+        try:
+            expected_len = int(first_line)
+        except ValueError:
+            return data
+
+        start = newline_idx + 1
+        end = start + expected_len
+        if end <= len(data):
+            return data[start:end]
+        return data[start:]
     
     def _add_attachments(self, mail, attachments):
         """Add attachments to mail item"""
@@ -914,18 +1765,23 @@ class EmlToPstConverter:
                     except OSError as e:
                         logger.debug("Could not remove temp file %s: %s", temp_path, e)
         
-    def show_completion(self, converted, skipped, errors, note=""):
+    def show_completion(self, converted, skipped, errors, note="", lang=None):
         """Show completion message"""
-        self.status_label.config(text="Conversion Complete")
+        if lang is None:
+            lang = self._current_lang()
+        self.status_label.config(text=t(lang, "status_complete"))
         self.progress.config(value=self.progress['maximum'])
         
-        msg = "Conversion Complete!\n\n"
-        msg += f"Converted: {converted} files\n"
-        msg += f"Skipped (duplicates): {skipped} files\n"
-        msg += f"Errors: {errors} files"
+        msg = t(
+            lang,
+            "msg_complete",
+            converted=converted,
+            skipped=skipped,
+            errors=errors,
+        )
         msg += note
         
-        messagebox.showinfo("Complete", msg)
+        messagebox.showinfo(t(lang, "title_complete"), msg)
 
 
 def main():
