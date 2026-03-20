@@ -13,6 +13,24 @@ A Python GUI application to convert EML/EMLX email files to Outlook PST format.
 - **File Management**: Right-click context menu to remove selected files or clear all
 - **Secure**: Path traversal protection for attachments, secure temp file handling
 
+## Dates and MIME headers
+
+- **Native import** (Outlook `OpenSharedItem`): When it succeeds, Outlook keeps the
+  message as stored in the `.eml` / `.emlx`, including **`Date:`**, the **`Received:`**
+  hop chain, **`Content-Type`**, and the rest of the MIME structure.
+- **Strict mode** (checkbox, **off by default**): When on, if native import fails the
+  app tries a fallback that **must** apply a delivery time from **`Date:`** /
+  **`Received:`** headers only; if that fails, the message is **skipped**. When off,
+  fallback import still writes MIME headers to Outlook where possible, but uses
+  **Windows “Date modified” on the original `.eml` file** for the Outlook message time
+  **first** (if the mtime checkbox is on—it is **on by default**), then header dates
+  if needed, then mtime again as last resort.
+- **File modified time** checkbox (default **on**): Outlook’s message time is set from
+  the **original .eml file’s** Explorer **Date modified** / **Módosítás dátuma**
+  (`os.path.getmtime`) for **both** native import and fallback—so the PST list matches
+  the folder you picked files from. Turn it **off** to leave times from the email
+  content only (native import / headers), without that Explorer stamp.
+
 ## Download
 
 Pre-built executables are available in the `dist` folder:
